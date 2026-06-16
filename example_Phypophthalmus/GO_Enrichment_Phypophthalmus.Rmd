@@ -1,0 +1,1927 @@
+---
+title: "GO Enrichment Analysis for Non-Model Organisms"
+subtitle: "*Pangasianodon hypophthalmus* (Striped Catfish) — Using `clusterProfiler::enricher()`"
+author: "Phuong Nguyen"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.width  = 10,
+  fig.height = 7,
+  fig.align  = "center",
+  cache      = TRUE
+)
+```
+
+# Overview
+
+This pipeline performs Gene Ontology (GO) enrichment analysis for a non-model
+organism (*Pangasianodon hypophthalmus*, striped catfish, NCBI TaxID: **310915**)
+using NCBI's `gene2go` annotation file and the `clusterProfiler::enricher()`
+function, which accepts any custom gene-to-term mapping.
+
+**Workflow summary:**
+
+1. Load a pre-filtered organism GO annotation file (`Phypophthalmus_gene2go.tsv`).
+2. Read the DE gene list from an external text file (`de_gene_list.txt`).
+3. Run over-representation analysis (ORA) with `enricher()` for each GO
+   ontology (BP, MF, CC).
+4. Visualise results with 15+ plot types: dot plots, bar plots, enrichment
+   maps, tree plots, category–gene networks, heatmaps, upset plots, lollipop
+   plots, bubble plots, GO circle plots, waterfall plots, enrichment volcanos,
+   word clouds, faceted dot matrices, and publication-ready combined figures.
+5. Export all results as TSV and all plots as 300-dpi PNGs.
+
+**Required input files** (place in the working directory):
+
+| File | Description |
+|------|-------------|
+| `Phypophthalmus_gene2go.tsv` | Organism GO annotations (see preparation section) |
+| `de_gene_list.txt` | Your DE genes — NCBI Gene IDs **or** gene symbols, one per line |
+| `Phypophthalmus_gene_info.tsv` | *(Optional)* Symbol ↔ ID lookup. Required only if your gene list uses symbols instead of numeric IDs |
+
+# Setup
+
+## Install / Load Packages
+
+```{r install-packages, eval=FALSE}
+# ── Run once ──
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+BiocManager::install(c("clusterProfiler", "enrichplot", "GO.db",
+                       "AnnotationDbi", "topGO"))
+install.packages(c("tidyverse", "DT", "scales", "ggrepel", "ggwordcloud"))
+```
+
+```{r load-packages}
+library(tidyverse)
+library(clusterProfiler)
+library(enrichplot)
+library(GO.db)
+library(AnnotationDbi)
+library(DT)
+library(scales)
+library(ggrepel)
+# ggwordcloud loaded conditionally in the word cloud chunk
+
+# ── Resolve namespace conflicts ──
+# AnnotationDbi::select() masks dplyr::select(); restore dplyr as default
+select <- dplyr::select
+```
+
+## Define Parameters
+
+```{r params}
+# ── Organism ──
+TAXID        <- 310915
+SPECIES_NAME <- "Pangasianodon hypophthalmus"
+
+# ── Enrichment thresholds ──
+PVALUE_CUTOFF  <- 0.05
+QVALUE_CUTOFF  <- 0.2
+MIN_GENE_SET   <- 5
+MAX_GENE_SET   <- 500
+
+# ── Colour palette for ontology facets ──
+ontology_colours <- c("BP" = "#E64B35", "MF" = "#4DBBD5", "CC" = "#00A087")
+
+# ── Output directory ──
+OUT_DIR <- "GO_results"
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+```
+
+# Preparing `gene2go_sp` (One-Time Pre-Processing)
+
+The `gene2go` file from NCBI's Gene FTP maps every Gene ID to its associated GO
+terms.  It is \~1.3 GB compressed and covers **all organisms** in NCBI Gene.
+You only need to do this **once** — the filtered output file
+(`Phypophthalmus_gene2go.tsv`) is small and reusable across analyses.
+
+## Step-by-step instructions
+
+**Step 1.** Download the file from NCBI FTP (terminal or R):
+
+```bash
+# Terminal — fastest method
+wget https://ftp.ncbi.nlm.nih.gov/gene/DATA/gene2go.gz
+gunzip gene2go.gz
+```
+
+Or in R:
+
+```{r download-instructions, eval=FALSE}
+download.file(
+  url      = "https://ftp.ncbi.nlm.nih.gov/gene/DATA/gene2go.gz",
+  destfile = "gene2go.gz",
+  mode     = "wb"
+)
+R.utils::gunzip("gene2go.gz", remove = TRUE)
+```
+
+**Step 2.** Read the full file and filter for your organism:
+
+```{r filter-instructions, eval=FALSE}
+gene2go_raw <- read.delim("gene2go", header = TRUE, comment.char = "#",
+                           stringsAsFactors = FALSE)
+
+colnames(gene2go_raw) <- c("TaxID", "GeneID", "GO_ID", "Evidence",
+                            "Qualifier", "GO_term", "PubMed", "Category")
+
+# ── Filter for Pangasianodon hypophthalmus (TaxID 310915) ──
+# Change the TaxID below for a different organism.
+# Common examples:
+#   Oreochromis niloticus (Nile tilapia)  = 8128
+#   Ictalurus punctatus (channel catfish)  = 7998
+#   Crassostrea gigas (Pacific oyster)     = 29159
+gene2go_sp <- gene2go_raw[gene2go_raw$TaxID == 310915, ]
+
+write.table(gene2go_sp, file = "Phypophthalmus_gene2go.tsv",
+            sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+**Step 3.** You can now delete the large `gene2go` file — only the small
+filtered TSV (`Phypophthalmus_gene2go.tsv`) is needed by this pipeline.
+
+---
+
+# Load Pre-Filtered GO Annotations
+
+This pipeline assumes `Phypophthalmus_gene2go.tsv` already exists in the
+working directory (see instructions above).
+
+```{r load-gene2go}
+GENE2GO_FILE <- "Phypophthalmus_gene2go.tsv"
+
+if (!file.exists(GENE2GO_FILE)) {
+  stop("File not found: ", GENE2GO_FILE,
+       "\n  Please follow the preparation steps above to generate it first.")
+}
+
+gene2go_sp <- read.delim(GENE2GO_FILE, stringsAsFactors = FALSE)
+
+cat(sprintf(
+  "GO annotations for %s (TaxID %d):\n  %s unique genes\n  %s unique GO terms\n  %s gene–GO associations\n",
+  SPECIES_NAME, TAXID,
+  comma(n_distinct(gene2go_sp$GeneID)),
+  comma(n_distinct(gene2go_sp$GO_ID)),
+  comma(nrow(gene2go_sp))
+))
+```
+
+## Annotation Summary by Ontology
+
+```{r annotation-summary}
+gene2go_sp %>%
+  group_by(Category) %>%
+  summarise(
+    Genes      = n_distinct(GeneID),
+    GO_terms   = n_distinct(GO_ID),
+    Associations = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(Category = recode(Category,
+    "Function"  = "Molecular Function (MF)",
+    "Process"   = "Biological Process (BP)",
+    "Component" = "Cellular Component (CC)"
+  )) %>%
+  arrange(desc(Associations)) %>%
+  datatable(
+    caption  = "GO annotation coverage by ontology",
+    rownames = FALSE,
+    options  = list(dom = "t", pageLength = 3)
+  )
+```
+
+## Evidence Code Distribution
+
+```{r evidence-codes, fig.height=5}
+gene2go_sp %>%
+  count(Evidence, sort = TRUE) %>%
+  mutate(Evidence = fct_reorder(Evidence, n)) %>%
+  ggplot(aes(x = Evidence, y = n)) +
+  geom_col(fill = "#3C8DAD") +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = paste0("GO Evidence Code Distribution — ", SPECIES_NAME),
+    subtitle = "IEA (Inferred from Electronic Annotation) dominates in non-model organisms",
+    x = NULL, y = "Number of associations"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+# Input Gene List
+
+## Preparing the Symbol ↔ ID Lookup Table (One-Time)
+
+If your DE gene list uses **gene symbols** (e.g., `tlr3`, `nfkb1`) instead of
+NCBI Gene IDs, you need a mapping table.  NCBI's `gene_info` file provides
+this for all organisms.  Prepare it once, just like `gene2go`:
+
+```bash
+# Terminal — download gene_info (~2 GB compressed)
+wget https://ftp.ncbi.nlm.nih.gov/gene/DATA/gene_info.gz
+gunzip gene_info.gz
+```
+
+```{r gene-info-prep-instructions, eval=FALSE}
+# ── Alternative: download in R ──
+download.file("https://ftp.ncbi.nlm.nih.gov/gene/DATA/gene_info.gz",
+              "gene_info.gz", mode = "wb")
+R.utils::gunzip("gene_info.gz", remove = TRUE)
+
+# ── Read and filter for your organism ──
+# this following steps take forever to run, so we need to use bash to extract gene_info with TaxID we want
+#gene_info_raw <- read.delim("gene_info", header = TRUE, comment.char = "#",
+                             quote = "", stringsAsFactors = FALSE)
+#colnames(gene_info_raw)[1] <- "TaxID"
+
+### Assume that we already filter gene_info for TaxID "310915" (P. hypophthalmus) -> gene_info_sp.txt available
+
+gene_info_sp0 <- read.delim("gene_info_sp.txt", header = TRUE,
+                             quote = "", stringsAsFactors = FALSE)
+colnames(gene_info_sp0)[1] <- "TaxID"
+
+gene_info_sp <- gene_info_sp0 %>%
+  select(GeneID, Symbol, Synonyms, description, type_of_gene)
+
+write.table(gene_info_sp, file = "Phypophthalmus_gene_info.tsv",
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+# You can now delete the large gene_info file
+```
+
+The filtered file (`Phypophthalmus_gene_info.tsv`) is small (~3 MB) and maps
+every gene symbol (and synonym) to its NCBI Gene ID.
+
+## Load Symbol Lookup Table
+
+```{r load-gene-info}
+GENE_INFO_FILE <- "Phypophthalmus_gene_info.tsv"
+
+if (file.exists(GENE_INFO_FILE)) {
+  gene_info_sp <- read.delim(GENE_INFO_FILE, stringsAsFactors = FALSE)
+  HAS_GENE_INFO <- TRUE
+  cat(sprintf("Gene info loaded: %s genes with symbol mappings\n",
+              comma(nrow(gene_info_sp))))
+} else {
+  HAS_GENE_INFO <- FALSE
+  message("Gene info file not found: ", GENE_INFO_FILE,
+          "\n  Symbol-to-ID conversion will not be available.",
+          "\n  Only numeric NCBI Gene IDs will be accepted as input.",
+          "\n  See instructions above to generate the lookup table.")
+}
+```
+
+## Symbol → NCBI Gene ID Converter
+
+```{r symbol-converter}
+convert_symbols_to_ids <- function(symbols, gene_info) {
+  # ── Step 1: exact match on Symbol column (case-insensitive) ──
+  lookup <- gene_info %>%
+    mutate(Symbol_lower = tolower(Symbol))
+
+  symbols_lower <- tolower(trimws(symbols))
+  match_df <- tibble(input = symbols, input_lower = symbols_lower) %>%
+    left_join(lookup %>% dplyr::select(GeneID, Symbol, Symbol_lower),
+              by = c("input_lower" = "Symbol_lower"))
+
+  matched   <- match_df %>% filter(!is.na(GeneID))
+  unmatched <- match_df %>% filter(is.na(GeneID))
+
+  # ── Step 2: search Synonyms column for remaining symbols ──
+  if (nrow(unmatched) > 0 && "Synonyms" %in% colnames(gene_info)) {
+    synonym_lookup <- gene_info %>%
+      filter(Synonyms != "-") %>%
+      mutate(syn_list = strsplit(Synonyms, "\\|")) %>%
+      unnest(syn_list) %>%
+      mutate(syn_lower = tolower(trimws(syn_list))) %>%
+      dplyr::select(GeneID, Symbol, syn_lower)
+
+    synonym_match <- unmatched %>%
+      dplyr::select(input, input_lower) %>%
+      left_join(synonym_lookup, by = c("input_lower" = "syn_lower"))
+
+    newly_matched <- synonym_match %>% filter(!is.na(GeneID))
+    still_unmatched <- synonym_match %>% filter(is.na(GeneID))
+
+    matched <- bind_rows(
+      matched %>% dplyr::select(input, GeneID, Symbol),
+      newly_matched %>% dplyr::select(input, GeneID, Symbol)
+    )
+    unmatched <- still_unmatched
+  }
+
+  # ── Report ──
+  cat(sprintf("Symbol conversion:\n  %d / %d symbols matched to NCBI Gene IDs\n",
+              nrow(matched), length(symbols)))
+
+  if (nrow(unmatched) > 0) {
+    cat(sprintf("  %d symbols NOT found:\n", nrow(unmatched)))
+    cat("    ", paste(head(unmatched$input, 20), collapse = ", "))
+    if (nrow(unmatched) > 20) cat(" ...")
+    cat("\n")
+  }
+
+  # ── Handle duplicates (one symbol mapping to multiple IDs) ──
+  dupes <- matched %>% group_by(input) %>% filter(n() > 1)
+  if (nrow(dupes) > 0) {
+    cat(sprintf("  %d symbols mapped to multiple IDs (first match kept):\n",
+                n_distinct(dupes$input)))
+    matched <- matched %>% group_by(input) %>% slice(1) %>% ungroup()
+  }
+
+  list(
+    ids       = matched$GeneID,
+    matched   = matched,
+    unmatched = unmatched$input
+  )
+}
+```
+
+## Read Input Gene List
+
+The pipeline auto-detects your input format:
+
+- **Numeric** → treated as NCBI Gene IDs directly.
+- **Non-numeric** → treated as gene symbols and converted via the lookup table.
+
+```{r input-gene-list}
+# ══════════════════════════════════════════════════════════════════════
+#                    *** EDIT THESE PATHS ***
+# ══════════════════════════════════════════════════════════════════════
+DE_GENE_FILE     <- "de_gene_list_symbols.txt"     # gene IDs or symbols (one per line)
+BACKGROUND_FILE  <- NULL                    # set to a file path for custom background,
+                                            # or leave NULL to use all annotated genes
+# ══════════════════════════════════════════════════════════════════════
+
+# ── Read DE gene list (raw lines, skip comments) ──
+if (!file.exists(DE_GENE_FILE)) {
+  stop("DE gene list not found: ", DE_GENE_FILE,
+       "\n  Please provide a text file with one gene per line.")
+}
+
+raw_lines <- readLines(DE_GENE_FILE)
+raw_lines <- raw_lines[!grepl("^\\s*#", raw_lines) & nchar(trimws(raw_lines)) > 0]
+raw_values <- trimws(sub("#.*", "", raw_lines))   # strip inline comments
+raw_values <- raw_values[nchar(raw_values) > 0]
+
+cat("Entries read from file:", length(raw_values), "\n")
+
+# ── Auto-detect format: numeric IDs vs. symbols ──
+is_numeric_input <- all(grepl("^\\d+$", raw_values))
+
+if (is_numeric_input) {
+  cat("Input detected as: NCBI Gene IDs (numeric)\n")
+  de_gene_ids <- as.integer(raw_values)
+} else {
+  cat("Input detected as: Gene symbols (non-numeric)\n")
+  if (!HAS_GENE_INFO) {
+    stop("Gene symbols detected but no lookup table available.\n",
+         "  Please generate ", GENE_INFO_FILE, " first (see instructions above),\n",
+         "  or provide NCBI Gene IDs instead.")
+  }
+  conversion <- convert_symbols_to_ids(raw_values, gene_info_sp)
+  de_gene_ids <- conversion$ids
+}
+
+cat("Gene IDs to test:", length(de_gene_ids), "\n")
+
+# ── Background: custom file or all annotated genes ──
+if (!is.null(BACKGROUND_FILE) && file.exists(BACKGROUND_FILE)) {
+  bg_raw <- readLines(BACKGROUND_FILE)
+  bg_raw <- bg_raw[!grepl("^\\s*#", bg_raw) & nchar(trimws(bg_raw)) > 0]
+  bg_values <- trimws(sub("#.*", "", bg_raw))
+  bg_is_numeric <- all(grepl("^\\d+$", bg_values))
+
+  if (bg_is_numeric) {
+    background_gene_ids <- as.integer(bg_values)
+  } else if (HAS_GENE_INFO) {
+    bg_conv <- convert_symbols_to_ids(bg_values, gene_info_sp)
+    background_gene_ids <- bg_conv$ids
+  } else {
+    stop("Background file contains symbols but no lookup table is available.")
+  }
+  cat("Custom background read:", length(background_gene_ids), "genes\n")
+} else {
+  background_gene_ids <- unique(gene2go_sp$GeneID)
+  cat("Background (all annotated genes):", length(background_gene_ids), "genes\n")
+}
+
+# ── Retain only DE genes present in the background ──
+de_in_bg  <- intersect(de_gene_ids, background_gene_ids)
+de_not_bg <- setdiff(de_gene_ids, background_gene_ids)
+
+cat(sprintf(
+  "  %d DE genes matched the background\n  %d DE genes had no GO annotation (excluded)\n",
+  length(de_in_bg), length(de_not_bg)
+))
+
+if (length(de_not_bg) > 0 && length(de_not_bg) <= 20) {
+  cat("  Excluded IDs:", paste(de_not_bg, collapse = ", "), "\n")
+}
+
+de_gene_ids <- de_in_bg
+```
+
+# GO Enrichment with `clusterProfiler::enricher()`
+
+## Prepare TERM2GENE and TERM2NAME Mappings
+
+`enricher()` requires two data frames:
+
+- **TERM2GENE**: columns `[term, gene]` — the full mapping of GO terms to genes.
+- **TERM2NAME**: columns `[term, name]` — human-readable names for each term.
+
+```{r prepare-mappings}
+# TERM2GENE: GO_ID → GeneID (character)
+term2gene <- gene2go_sp %>%
+  transmute(term = GO_ID, gene = as.character(GeneID)) %>%
+  distinct()
+
+# TERM2NAME: GO_ID → GO_term
+term2name <- gene2go_sp %>%
+  transmute(term = GO_ID, name = GO_term) %>%
+  distinct()
+
+cat(sprintf(
+  "TERM2GENE: %s rows  |  TERM2NAME: %s terms\n",
+  comma(nrow(term2gene)), comma(nrow(term2name))
+))
+```
+
+## Split Annotations by Ontology
+
+Running enrichment separately for Biological Process (BP), Molecular Function
+(MF), and Cellular Component (CC) makes the results easier to interpret and
+avoids mixing ontologies in a single test.
+
+```{r split-ontology}
+# Map NCBI categories to short codes
+category_map <- c("Process" = "BP", "Function" = "MF", "Component" = "CC")
+
+ontology_data <- gene2go_sp %>%
+  mutate(Ontology = category_map[Category]) %>%
+  split(.$Ontology)
+
+# Build per-ontology TERM2GENE / TERM2NAME
+t2g_list <- map(ontology_data, ~ .x %>%
+  transmute(term = GO_ID, gene = as.character(GeneID)) %>%
+  distinct()
+)
+
+t2n_list <- map(ontology_data, ~ .x %>%
+  transmute(term = GO_ID, name = GO_term) %>%
+  distinct()
+)
+```
+
+## Run enricher() for Each Ontology {.tabset}
+
+```{r run-enrichment}
+de_chars <- as.character(de_gene_ids)
+bg_chars <- as.character(background_gene_ids)
+
+enrich_results <- imap(t2g_list, function(t2g, ont) {
+  enricher(
+    gene          = de_chars,
+    universe      = bg_chars,
+    TERM2GENE     = t2g,
+    TERM2NAME     = t2n_list[[ont]],
+    pvalueCutoff  = PVALUE_CUTOFF,
+    qvalueCutoff  = QVALUE_CUTOFF,
+    pAdjustMethod = "BH",
+    minGSSize     = MIN_GENE_SET,
+    maxGSSize     = MAX_GENE_SET
+  )
+})
+
+# Summary
+imap_dfr(enrich_results, function(res, ont) {
+  n_sig <- if (!is.null(res) && nrow(res@result %>% filter(p.adjust < PVALUE_CUTOFF)) > 0)
+    nrow(res@result %>% filter(p.adjust < PVALUE_CUTOFF)) else 0
+  tibble(Ontology = ont, `Significant terms (padj < 0.05)` = n_sig)
+}) %>%
+  datatable(rownames = FALSE, options = list(dom = "t", pageLength = 3),
+            caption = "Number of significantly enriched GO terms per ontology")
+```
+
+### BP — Biological Process
+
+```{r bp-table}
+if (!is.null(enrich_results[["BP"]]) &&
+    nrow(as.data.frame(enrich_results[["BP"]])) > 0) {
+  as.data.frame(enrich_results[["BP"]]) %>%
+    dplyr::select(ID, Description, GeneRatio, BgRatio, pvalue, p.adjust, qvalue, Count) %>%
+    mutate(across(c(pvalue, p.adjust, qvalue), ~ signif(.x, 3))) %>%
+    datatable(
+      rownames = FALSE,
+      caption  = "Enriched Biological Process GO terms",
+      options  = list(pageLength = 15, scrollX = TRUE)
+    )
+} else {
+  cat("No significantly enriched BP terms at padj <", PVALUE_CUTOFF, "\n")
+}
+```
+
+### MF — Molecular Function
+
+```{r mf-table}
+if (!is.null(enrich_results[["MF"]]) &&
+    nrow(as.data.frame(enrich_results[["MF"]])) > 0) {
+  as.data.frame(enrich_results[["MF"]]) %>%
+    dplyr::select(ID, Description, GeneRatio, BgRatio, pvalue, p.adjust, qvalue, Count) %>%
+    mutate(across(c(pvalue, p.adjust, qvalue), ~ signif(.x, 3))) %>%
+    datatable(
+      rownames = FALSE,
+      caption  = "Enriched Molecular Function GO terms",
+      options  = list(pageLength = 15, scrollX = TRUE)
+    )
+} else {
+  cat("No significantly enriched MF terms at padj <", PVALUE_CUTOFF, "\n")
+}
+```
+
+### CC — Cellular Component
+
+```{r cc-table}
+if (!is.null(enrich_results[["CC"]]) &&
+    nrow(as.data.frame(enrich_results[["CC"]])) > 0) {
+  as.data.frame(enrich_results[["CC"]]) %>%
+    dplyr::select(ID, Description, GeneRatio, BgRatio, pvalue, p.adjust, qvalue, Count) %>%
+    mutate(across(c(pvalue, p.adjust, qvalue), ~ signif(.x, 3))) %>%
+    datatable(
+      rownames = FALSE,
+      caption  = "Enriched Cellular Component GO terms",
+      options  = list(pageLength = 15, scrollX = TRUE)
+    )
+} else {
+  cat("No significantly enriched CC terms at padj <", PVALUE_CUTOFF, "\n")
+}
+```
+
+## {-}
+
+# Helper: Extract Enrichment Data Frames
+
+Before plotting, we prepare tidy data frames from the enrichment results with
+parsed ratios and fold-enrichment values that are reused across multiple plot
+types.
+
+```{r helper-extract-df}
+# ── Parse GeneRatio "k/n" into numeric ──
+parse_ratio <- function(ratio_str) {
+  parts <- str_split(ratio_str, "/", simplify = TRUE)
+  as.numeric(parts[, 1]) / as.numeric(parts[, 2])
+}
+
+# ── Build a combined tidy data frame across all ontologies ──
+combined_df <- imap_dfr(enrich_results, function(res, ont) {
+  if (!is.null(res) && nrow(as.data.frame(res)) > 0) {
+    as.data.frame(res) %>%
+      mutate(
+        Ontology       = ont,
+        GeneRatioNum   = parse_ratio(GeneRatio),
+        BgRatioNum     = parse_ratio(BgRatio),
+        FoldEnrichment = GeneRatioNum / BgRatioNum,
+        neg_log10_padj = -log10(p.adjust),
+        RichFactor     = GeneRatioNum  # alias used in some plots
+      )
+  }
+})
+
+cat(sprintf("Combined enrichment table: %d terms across %d ontologies\n",
+            nrow(combined_df), n_distinct(combined_df$Ontology)))
+```
+
+# Visualisation — enrichplot Built-in Plots {.tabset}
+
+## Dot Plots
+
+Dot plots show enrichment significance on the x-axis and gene ratio (proportion
+of DE genes in the term) by dot size.  Colour encodes adjusted p-value.
+
+```{r dotplots, fig.height=8}
+for (ont in names(enrich_results)) {
+  res <- enrich_results[[ont]]
+  if (!is.null(res) && nrow(as.data.frame(res)) > 0) {
+    p <- dotplot(res, showCategory = 20, font.size = 11) +
+      ggtitle(paste0("GO ", ont, " — Dot Plot")) +
+      theme(plot.title = element_text(face = "bold", size = 14))
+    print(p)
+  }
+}
+```
+
+## Bar Plots
+
+Classic horizontal bar chart coloured by adjusted p-value.
+
+```{r barplots, fig.height=8}
+# Custom bar plot — replaces enrichplot::barplot() which was removed in
+# recent enrichplot versions.
+enrich_barplot <- function(res, showCategory = 20, font.size = 11) {
+  df <- as.data.frame(res) %>%
+    head(showCategory) %>%
+    mutate(
+      GeneRatioNum = sapply(GeneRatio, function(x) {
+        parts <- as.numeric(strsplit(x, "/")[[1]])
+        parts[1] / parts[2]
+      }),
+      Description = factor(Description, levels = rev(Description))
+    )
+  ggplot(df, aes(x = Count, y = Description, fill = p.adjust)) +
+    geom_col(width = 0.7) +
+    scale_fill_gradient(low = "#E64B35", high = "#4292C6",
+                        name = "p.adjust",
+                        trans = "log10") +
+    labs(x = "Count", y = NULL) +
+    theme_minimal(base_size = font.size)
+}
+
+for (ont in names(enrich_results)) {
+  res <- enrich_results[[ont]]
+  if (!is.null(res) && nrow(as.data.frame(res)) > 0) {
+    p <- enrich_barplot(res, showCategory = 20, font.size = 11) +
+      ggtitle(paste0("GO ", ont, " — Bar Plot")) +
+      theme(plot.title = element_text(face = "bold", size = 14))
+    print(p)
+  }
+}
+```
+
+## Enrichment Map (Network)
+
+The enrichment map connects GO terms that share overlapping gene sets (Jaccard
+similarity).  Clusters of connected nodes highlight functionally related
+processes.
+
+```{r emap, fig.width=12, fig.height=10}
+for (ont in names(enrich_results)) {
+  res <- enrich_results[[ont]]
+  if (!is.null(res) && nrow(as.data.frame(res)) >= 2) {
+    res_pw <- pairwise_termsim(res)
+    p <- emapplot(res_pw, showCategory = 30) +
+      ggtitle(paste0("GO ", ont, " — Enrichment Map")) +
+      theme(plot.title = element_text(face = "bold", size = 14))
+    print(p)
+  }
+}
+```
+
+## Category–Gene Network (cnetplot)
+
+Shows the linkages between GO terms and the actual DE genes annotated to each.
+Shared genes between terms appear as connections bridging multiple category
+nodes.
+
+```{r cnet, fig.width=13, fig.height=10}
+for (ont in names(enrich_results)) {
+  res <- enrich_results[[ont]]
+  if (!is.null(res) && nrow(as.data.frame(res)) >= 2) {
+    tryCatch({
+      p <- cnetplot(res, showCategory = 10) +
+        ggtitle(paste0("GO ", ont, " — Category–Gene Network")) +
+        theme(plot.title = element_text(face = "bold", size = 14))
+      print(p)
+    }, error = function(e) {
+      message("Cnetplot skipped for ", ont, ": ", e$message)
+    })
+  }
+}
+```
+
+## Category–Gene Network (Top 5 terms)
+
+A second cnetplot focused on fewer terms for a cleaner view of gene–term
+linkages.
+
+```{r cnet-top5, fig.width=13, fig.height=10}
+for (ont in names(enrich_results)) {
+  res <- enrich_results[[ont]]
+  if (!is.null(res) && nrow(as.data.frame(res)) >= 2) {
+    tryCatch({
+      p <- cnetplot(res, showCategory = 5) +
+        ggtitle(paste0("GO ", ont, " — Category–Gene Network (Top 5)")) +
+        theme(plot.title = element_text(face = "bold", size = 14))
+      print(p)
+    }, error = function(e) {
+      message("Cnetplot (top 5) skipped for ", ont, ": ", e$message)
+    })
+  }
+}
+```
+
+## Tree-Style Clustered Bar Plot
+
+Enriched terms clustered by pairwise gene-set overlap (Jaccard similarity) and
+displayed as a bar chart ordered by the dendrogram.  This is a version-safe
+replacement for `treeplot()`.
+
+```{r treeplot-custom, fig.width=14, fig.height=10}
+for (ont in names(enrich_results)) {
+  res <- enrich_results[[ont]]
+  if (is.null(res) || nrow(as.data.frame(res)) < 3) next
+
+  tryCatch({
+    res_df <- as.data.frame(res) %>% head(25)
+
+    # Build a binary gene × term matrix
+    gene_lists <- strsplit(res_df$geneID, "/")
+    all_genes  <- unique(unlist(gene_lists))
+    mat <- matrix(0, nrow = nrow(res_df), ncol = length(all_genes),
+                  dimnames = list(res_df$Description, all_genes))
+    for (i in seq_along(gene_lists)) {
+      mat[i, gene_lists[[i]]] <- 1
+    }
+
+    # Hierarchical clustering on Jaccard distance
+    jdist <- dist(mat, method = "binary")
+    hc    <- hclust(jdist, method = "ward.D2")
+
+    # Order descriptions by dendrogram
+    res_df$Description <- factor(res_df$Description,
+                                  levels = res_df$Description[hc$order])
+
+    p <- ggplot(res_df, aes(x = -log10(p.adjust), y = Description,
+                             fill = -log10(p.adjust))) +
+      geom_col(width = 0.7) +
+      scale_fill_gradient(low = "#FDD49E", high = "#B30000",
+                          name = expression(-log[10](p[adj]))) +
+      labs(
+        title = paste0("GO ", ont,
+                       " — Clustered Enrichment (Ward.D2 on Jaccard)"),
+        x     = expression(-log[10](p[adj])),
+        y     = NULL
+      ) +
+      theme_minimal(base_size = 11) +
+      theme(plot.title = element_text(face = "bold", size = 14))
+    print(p)
+  }, error = function(e) {
+    message("Clustered bar plot skipped for ", ont, ": ", e$message)
+  })
+}
+```
+
+## Upset Plot
+
+Upset plots show set intersections — which GO terms share the same DE genes.
+Useful for spotting genes that drive multiple enriched terms.
+
+```{r upset, fig.width=12, fig.height=7}
+for (ont in names(enrich_results)) {
+  res <- enrich_results[[ont]]
+  if (!is.null(res) && nrow(as.data.frame(res)) >= 2) {
+    tryCatch({
+      p <- upsetplot(res, n = 12)
+      print(p)
+    }, error = function(e) {
+      message("Upset plot skipped for ", ont, ": ", e$message)
+    })
+  }
+}
+```
+
+## Heatmap-like Plot
+
+A tile/heatmap showing which DE genes are annotated to each enriched GO term.
+
+```{r heatplot, fig.width=14, fig.height=9}
+for (ont in names(enrich_results)) {
+  res <- enrich_results[[ont]]
+  if (!is.null(res) && nrow(as.data.frame(res)) >= 2) {
+    tryCatch({
+      p <- heatplot(res, showCategory = 20) +
+        ggtitle(paste0("GO ", ont, " — Gene–Term Heatmap")) +
+        theme(
+          plot.title = element_text(face = "bold", size = 14),
+          axis.text.x = element_text(angle = 45, hjust = 1, size = 8)
+        )
+      print(p)
+    }, error = function(e) {
+      message("Heatplot skipped for ", ont, ": ", e$message)
+    })
+  }
+}
+```
+
+## {-}
+
+# Visualisation — Custom ggplot2 Plots {.tabset}
+
+The following plots are built with ggplot2 from the enrichment data frame,
+giving full control over aesthetics.  They are commonly used in publications and
+supplement the built-in enrichplot functions.
+
+## Lollipop Plot
+
+A cleaner alternative to bar charts.  The dot encodes gene count and the
+segment length encodes significance.
+
+```{r lollipop, fig.width=11, fig.height=8}
+for (ont in names(enrich_results)) {
+  df_ont <- combined_df %>% filter(Ontology == ont) %>%
+    slice_min(p.adjust, n = 25) %>%
+    mutate(Description = str_wrap(Description, width = 50),
+           Description = fct_reorder(Description, neg_log10_padj))
+
+  if (nrow(df_ont) == 0) next
+
+  p <- ggplot(df_ont, aes(x = neg_log10_padj, y = Description)) +
+    geom_segment(aes(x = 0, xend = neg_log10_padj, yend = Description),
+                 colour = "grey60", linewidth = 0.5) +
+    geom_point(aes(size = Count, colour = FoldEnrichment)) +
+    scale_colour_gradient(low = "#FDD49E", high = "#D7301F",
+                          name = "Fold Enrichment") +
+    scale_size_continuous(range = c(2, 8), name = "Gene Count") +
+    geom_vline(xintercept = -log10(0.05), linetype = "dashed",
+               colour = "grey40", linewidth = 0.4) +
+    labs(
+      title = paste0("GO ", ont, " — Lollipop Plot"),
+      x     = expression(-log[10](p.adjust)),
+      y     = NULL
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold", size = 14))
+  print(p)
+}
+```
+
+## Bubble Plot (Fold Enrichment × Count)
+
+Bubble plots map fold enrichment to the x-axis, significance to colour, and
+gene count to bubble size — encoding three dimensions simultaneously.
+
+```{r bubble, fig.width=12, fig.height=8}
+for (ont in names(enrich_results)) {
+  df_ont <- combined_df %>% filter(Ontology == ont) %>%
+    slice_min(p.adjust, n = 25) %>%
+    mutate(Description = str_wrap(Description, width = 45),
+           Description = fct_reorder(Description, FoldEnrichment))
+
+  if (nrow(df_ont) == 0) next
+
+  p <- ggplot(df_ont, aes(x = FoldEnrichment, y = Description)) +
+    geom_point(aes(size = Count, colour = neg_log10_padj)) +
+    scale_colour_gradient(low = "#DEEBF7", high = "#08519C",
+                          name = expression(-log[10](p[adj]))) +
+    scale_size_continuous(range = c(3, 10), name = "Gene Count") +
+    labs(
+      title = paste0("GO ", ont, " — Bubble Plot"),
+      x     = "Fold Enrichment",
+      y     = NULL
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold", size = 14))
+  print(p)
+}
+```
+
+## GO Circle Plot
+
+A custom "GO circle" shows enriched terms as segments of a circle with bar
+height proportional to `-log10(padj)` and fill colour encoding the ontology.
+This is inspired by the GOplot package style.
+
+```{r go-circle, fig.width=10, fig.height=10}
+if (nrow(combined_df) > 0) {
+  circle_df <- combined_df %>%
+    group_by(Ontology) %>%
+    slice_min(p.adjust, n = 8) %>%
+    ungroup() %>%
+    arrange(Ontology, p.adjust) %>%
+    mutate(
+      term_label = str_trunc(Description, 40),
+      term_id    = row_number()
+    )
+
+  n_terms <- nrow(circle_df)
+
+  p <- ggplot(circle_df,
+              aes(x = reorder(term_label, term_id),
+                  y = neg_log10_padj, fill = Ontology)) +
+    geom_col(width = 0.8) +
+    coord_polar(start = 0) +
+    scale_fill_manual(values = ontology_colours) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed",
+               colour = "grey30", linewidth = 0.3) +
+    labs(
+      title = paste0("GO Circle — Top Enriched Terms by Ontology"),
+      x     = NULL,
+      y     = expression(-log[10](p[adj]))
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 14, hjust = 0.5),
+      axis.text.x      = element_text(size = 8),
+      axis.text.y      = element_blank(),
+      panel.grid.major = element_line(colour = "grey90", linewidth = 0.2)
+    )
+  print(p)
+}
+```
+
+## Waterfall Plot (Ranked Significance)
+
+All significant terms ranked by adjusted p-value, coloured by ontology.  Gives
+a quick sense of overall enrichment depth and which ontologies dominate.
+
+```{r waterfall, fig.width=11, fig.height=7}
+if (nrow(combined_df) > 0) {
+  wf_df <- combined_df %>%
+    filter(p.adjust < PVALUE_CUTOFF) %>%
+    arrange(p.adjust) %>%
+    mutate(Rank = row_number())
+
+  if (nrow(wf_df) > 0) {
+    p <- ggplot(wf_df, aes(x = Rank, y = neg_log10_padj,
+                            fill = Ontology)) +
+      geom_col(width = 0.8) +
+      scale_fill_manual(values = ontology_colours) +
+      geom_hline(yintercept = -log10(0.05), linetype = "dashed",
+                 colour = "grey40") +
+      annotate("text", x = max(wf_df$Rank) * 0.9,
+               y = -log10(0.05) + 0.3, label = "padj = 0.05",
+               size = 3.5, colour = "grey40") +
+      labs(
+        title = paste0("Waterfall Plot — All Significant GO Terms Ranked"),
+        x     = "Rank (ordered by p.adjust)",
+        y     = expression(-log[10](p[adj]))
+      ) +
+      theme_minimal(base_size = 12) +
+      theme(plot.title = element_text(face = "bold", size = 14))
+    print(p)
+  }
+}
+```
+
+## Fold Enrichment vs. Significance (Volcano-Style)
+
+A scatter plot with fold enrichment on the x-axis and `-log10(padj)` on the
+y-axis, sized by gene count.  Analogous to a volcano plot for enrichment.
+
+```{r volcano-enrich, fig.width=11, fig.height=8}
+if (nrow(combined_df) > 0) {
+  p <- ggplot(combined_df,
+              aes(x = log2(FoldEnrichment),
+                  y = neg_log10_padj)) +
+    geom_point(aes(size = Count, colour = Ontology), alpha = 0.7) +
+    scale_colour_manual(values = ontology_colours) +
+    scale_size_continuous(range = c(2, 9), name = "Gene Count") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed",
+               colour = "grey40") +
+    geom_vline(xintercept = 0, linetype = "dotted", colour = "grey60") +
+    ggrepel::geom_text_repel(
+      data = combined_df %>%
+        group_by(Ontology) %>%
+        slice_min(p.adjust, n = 3) %>%
+        ungroup(),
+      aes(label = str_trunc(Description, 35)),
+      size = 3, max.overlaps = 15, box.padding = 0.5,
+      show.legend = FALSE
+    ) +
+    labs(
+      title = "Enrichment Volcano — Fold Enrichment vs. Significance",
+      x     = expression(log[2](Fold~Enrichment)),
+      y     = expression(-log[10](p[adj]))
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold", size = 14))
+  print(p)
+}
+```
+
+## Dot Matrix (Multi-Ontology Comparison)
+
+Side-by-side comparison of top terms from each ontology in a faceted dot plot.
+
+```{r dot-matrix, fig.width=14, fig.height=10}
+if (nrow(combined_df) > 0) {
+  facet_df <- combined_df %>%
+    group_by(Ontology) %>%
+    slice_min(p.adjust, n = 15) %>%
+    ungroup() %>%
+    mutate(
+      Description = str_wrap(Description, width = 40),
+      Ontology_label = recode(Ontology,
+        "BP" = "Biological Process",
+        "MF" = "Molecular Function",
+        "CC" = "Cellular Component"
+      )
+    )
+
+  p <- ggplot(facet_df,
+              aes(x = GeneRatioNum, y = reorder(Description, GeneRatioNum))) +
+    geom_point(aes(size = Count, colour = neg_log10_padj)) +
+    scale_colour_gradient(low = "#FEE8C8", high = "#B30000",
+                          name = expression(-log[10](p[adj]))) +
+    scale_size_continuous(range = c(2, 8), name = "Gene Count") +
+    facet_wrap(~ Ontology_label, scales = "free_y", ncol = 3) +
+    labs(
+      title = paste0("GO Enrichment Overview — ", SPECIES_NAME),
+      x     = "Gene Ratio (k / n)",
+      y     = NULL
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title   = element_text(face = "bold", size = 14),
+      strip.text   = element_text(face = "bold", size = 12),
+      panel.border = element_rect(colour = "grey80", fill = NA)
+    )
+  print(p)
+}
+```
+
+## Gene–Term Heatmap (Custom)
+
+A tile plot showing which DE genes map to the top enriched terms, with
+hierarchical clustering on both axes.  More control than `heatplot()`.
+
+```{r gene-term-heatmap-custom, fig.width=14, fig.height=9}
+for (ont in names(enrich_results)) {
+  res <- enrich_results[[ont]]
+  if (is.null(res) || nrow(as.data.frame(res)) < 3) next
+
+  res_df <- as.data.frame(res) %>%
+    slice_min(p.adjust, n = 20)
+
+  # Build the binary gene × term matrix
+  gene_term_list <- res_df %>%
+    dplyr::select(ID, Description, geneID) %>%
+    mutate(genes = str_split(geneID, "/")) %>%
+    unnest(genes) %>%
+    dplyr::select(Description, genes)
+
+  mat <- gene_term_list %>%
+    mutate(present = 1) %>%
+    pivot_wider(names_from = genes, values_from = present, values_fill = 0)
+
+  term_names <- mat$Description
+  mat <- as.matrix(mat[, -1])
+  rownames(mat) <- term_names
+
+  # Cluster
+  if (nrow(mat) >= 2 && ncol(mat) >= 2) {
+    row_ord <- hclust(dist(mat, method = "binary"))$order
+    col_ord <- hclust(dist(t(mat), method = "binary"))$order
+    mat <- mat[row_ord, col_ord]
+  }
+
+  heatmap_df <- as.data.frame(mat) %>%
+    rownames_to_column("GO_term") %>%
+    pivot_longer(-GO_term, names_to = "GeneID", values_to = "Annotated") %>%
+    mutate(
+      GO_term = factor(GO_term, levels = rownames(mat)),
+      GeneID  = factor(GeneID, levels = colnames(mat))
+    )
+
+  p <- ggplot(heatmap_df, aes(x = GeneID, y = GO_term, fill = factor(Annotated))) +
+    geom_tile(colour = "white", linewidth = 0.3) +
+    scale_fill_manual(
+      values = c("0" = "grey95", "1" = ontology_colours[ont]),
+      labels = c("No", "Yes"), name = "Annotated"
+    ) +
+    labs(
+      title = paste0("GO ", ont, " — Gene × Term Heatmap (clustered)"),
+      x     = "Gene ID",
+      y     = NULL
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 14),
+      axis.text.x   = element_text(angle = 55, hjust = 1, size = 7),
+      axis.text.y   = element_text(size = 8),
+      legend.position = "bottom"
+    )
+  print(p)
+}
+```
+
+## Word Cloud of Enriched Terms
+
+A word cloud built from GO term descriptions weighted by significance.
+Requires the `ggwordcloud` package.
+
+```{r wordcloud, fig.width=10, fig.height=8}
+if (requireNamespace("ggwordcloud", quietly = TRUE) && nrow(combined_df) > 0) {
+  library(ggwordcloud)
+
+  wc_df <- combined_df %>%
+    filter(p.adjust < PVALUE_CUTOFF) %>%
+    # split multi-word descriptions into tokens
+    mutate(words = str_split(Description, "\\s+")) %>%
+    unnest(words) %>%
+    mutate(words = str_to_lower(words)) %>%
+    # remove common stop words
+    filter(!words %in% c("of", "to", "in", "by", "the", "a", "an", "and",
+                          "or", "via", "from", "with", "into", "for")) %>%
+    filter(nchar(words) > 2) %>%
+    group_by(words, Ontology) %>%
+    summarise(freq = n(), avg_sig = mean(neg_log10_padj), .groups = "drop") %>%
+    slice_max(freq, n = 80)
+
+  p <- ggplot(wc_df, aes(label = words, size = freq, colour = Ontology)) +
+    ggwordcloud::geom_text_wordcloud(area_corr = TRUE, shape = "circle") +
+    scale_size_area(max_size = 16) +
+    scale_colour_manual(values = ontology_colours) +
+    labs(title = "Word Cloud of Enriched GO Term Descriptions") +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 14))
+  print(p)
+} else if (nrow(combined_df) > 0) {
+  message("Install ggwordcloud for word cloud: install.packages('ggwordcloud')")
+}
+```
+
+## {-}
+
+# Combined Three-Ontology Summary Plots
+
+## Combined Horizontal Bar Plot
+
+Top enriched terms from all three ontologies in a single view, colour-coded.
+
+```{r combined-barplot, fig.width=12, fig.height=9}
+if (nrow(combined_df) > 0) {
+  bar_df <- combined_df %>%
+    group_by(Ontology) %>%
+    slice_min(p.adjust, n = 10) %>%
+    ungroup() %>%
+    mutate(
+      Description = str_wrap(Description, width = 45),
+      Description = fct_reorder(Description, neg_log10_padj)
+    )
+
+  p <- ggplot(bar_df, aes(x = neg_log10_padj, y = Description,
+                           fill = Ontology)) +
+    geom_col(width = 0.7) +
+    scale_fill_manual(values = ontology_colours) +
+    geom_vline(xintercept = -log10(0.05), linetype = "dashed",
+               colour = "grey40") +
+    labs(
+      title    = paste0("Top Enriched GO Terms — ", SPECIES_NAME),
+      subtitle = "Dashed line = padj = 0.05 threshold",
+      x = expression(-log[10](p[adj])),
+      y = NULL
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title      = element_text(face = "bold"),
+      legend.position = "top"
+    )
+  print(p)
+}
+```
+
+## Combined Dot Plot (Publication-Ready)
+
+A compact dot plot designed for journal figures.  Gene ratio on the x-axis,
+colour for significance, shape for ontology.
+
+```{r combined-dot-pub, fig.width=12, fig.height=10}
+if (nrow(combined_df) > 0) {
+  pub_df <- combined_df %>%
+    group_by(Ontology) %>%
+    slice_min(p.adjust, n = 8) %>%
+    ungroup() %>%
+    mutate(
+      Description = str_wrap(Description, width = 50),
+      Description = fct_reorder(Description, GeneRatioNum)
+    )
+
+  p <- ggplot(pub_df, aes(x = GeneRatioNum, y = Description)) +
+    geom_point(aes(size = Count, colour = neg_log10_padj,
+                   shape = Ontology)) +
+    scale_colour_viridis_c(option = "inferno", direction = -1,
+                           name = expression(-log[10](p[adj]))) +
+    scale_shape_manual(values = c("BP" = 16, "MF" = 17, "CC" = 15),
+                       name = "Ontology") +
+    scale_size_continuous(range = c(3, 10), name = "Gene Count") +
+    labs(
+      title = paste0("GO Enrichment Summary — ", SPECIES_NAME),
+      x     = "Gene Ratio (k / n)",
+      y     = NULL
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title      = element_text(face = "bold", size = 14),
+      legend.position = "right"
+    )
+  print(p)
+}
+```
+
+## Ontology Composition Stacked Bar
+
+Shows how many significant terms belong to each ontology category.
+
+```{r ontology-composition, fig.width=8, fig.height=5}
+if (nrow(combined_df) > 0) {
+  sig_counts <- combined_df %>%
+    filter(p.adjust < PVALUE_CUTOFF) %>%
+    count(Ontology, name = "n_terms") %>%
+    mutate(
+      pct   = n_terms / sum(n_terms) * 100,
+      label = paste0(n_terms, " (", round(pct, 1), "%)")
+    )
+
+  p <- ggplot(sig_counts, aes(x = "", y = n_terms, fill = Ontology)) +
+    geom_col(width = 0.6) +
+    geom_text(aes(label = label), position = position_stack(vjust = 0.5),
+              size = 4.5, fontface = "bold") +
+    scale_fill_manual(values = ontology_colours) +
+    coord_flip() +
+    labs(
+      title = "Distribution of Significant GO Terms by Ontology",
+      x     = NULL,
+      y     = "Number of enriched terms (padj < 0.05)"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title      = element_text(face = "bold"),
+      legend.position = "top",
+      axis.text.y     = element_blank()
+    )
+  print(p)
+}
+```
+
+# Save All Plots to Files
+
+```{r save-plots, fig.show='hide'}
+PLOT_DIR <- file.path(OUT_DIR, "plots")
+dir.create(PLOT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# ── Helper: build the plot inside tryCatch so failures are caught ──
+safe_save <- function(filename, plot_expr_fn, w = 10, h = 8) {
+  tryCatch({
+    p <- plot_expr_fn()            # evaluate inside tryCatch
+    ggsave(file.path(PLOT_DIR, filename), plot = p,
+           width = w, height = h, dpi = 300, bg = "white")
+    message("Saved: ", filename)
+  }, error = function(e) {
+    message("Skipped ", filename, ": ", e$message)
+  })
+}
+
+# ── Per-ontology enrichplot plots ──
+for (ont in names(enrich_results)) {
+  res <- enrich_results[[ont]]
+  if (is.null(res) || nrow(as.data.frame(res)) == 0) next
+
+  # Dot plot
+  safe_save(paste0("dotplot_", ont, ".png"), function() {
+    dotplot(res, showCategory = 20, font.size = 10) +
+      ggtitle(paste0("GO ", ont, " — Dot Plot"))
+  })
+
+  # Bar plot
+  safe_save(paste0("barplot_", ont, ".png"), function() {
+    enrich_barplot(res, showCategory = 20, font.size = 10) +
+      ggtitle(paste0("GO ", ont, " — Bar Plot"))
+  })
+
+  # Enrichment map
+  if (nrow(as.data.frame(res)) >= 2) {
+    res_pw <- pairwise_termsim(res)
+
+    safe_save(paste0("emap_", ont, ".png"), function() {
+      emapplot(res_pw, showCategory = 30) +
+        ggtitle(paste0("GO ", ont, " — Enrichment Map"))
+    }, w = 12, h = 10)
+
+    # Clustered bar plot (replaces treeplot)
+    if (nrow(as.data.frame(res)) >= 3) {
+      safe_save(paste0("clustered_bar_", ont, ".png"), function() {
+        res_df <- as.data.frame(res) %>% head(25)
+        gene_lists <- strsplit(res_df$geneID, "/")
+        all_genes  <- unique(unlist(gene_lists))
+        mat <- matrix(0, nrow = nrow(res_df), ncol = length(all_genes),
+                      dimnames = list(res_df$Description, all_genes))
+        for (i in seq_along(gene_lists)) mat[i, gene_lists[[i]]] <- 1
+        hc <- hclust(dist(mat, method = "binary"), method = "ward.D2")
+        res_df$Description <- factor(res_df$Description,
+                                      levels = res_df$Description[hc$order])
+        ggplot(res_df, aes(x = -log10(p.adjust), y = Description,
+                           fill = -log10(p.adjust))) +
+          geom_col(width = 0.7) +
+          scale_fill_gradient(low = "#FDD49E", high = "#B30000") +
+          labs(title = paste0("GO ", ont, " — Clustered Enrichment"),
+               x = expression(-log[10](p[adj])), y = NULL) +
+          theme_minimal(base_size = 11) +
+          theme(plot.title = element_text(face = "bold"))
+      }, w = 14, h = 10)
+    }
+
+    # Heatmap
+    safe_save(paste0("heatplot_", ont, ".png"), function() {
+      heatplot(res, showCategory = 20) +
+        ggtitle(paste0("GO ", ont, " — Heatmap"))
+    }, w = 14, h = 9)
+
+    # Category-gene network
+    safe_save(paste0("cnetplot_", ont, ".png"), function() {
+      cnetplot(res, showCategory = 10) +
+        ggtitle(paste0("GO ", ont, " — Category–Gene Network"))
+    }, w = 13, h = 10)
+  }
+}
+
+# ── Combined plots ──
+if (nrow(combined_df) > 0) {
+  # Combined bar
+  safe_save("combined_barplot.png", function() {
+    bar_df <- combined_df %>%
+      group_by(Ontology) %>% slice_min(p.adjust, n = 10) %>% ungroup() %>%
+      mutate(Description = str_wrap(Description, 45),
+             Description = fct_reorder(Description, neg_log10_padj))
+    ggplot(bar_df, aes(x = neg_log10_padj, y = Description, fill = Ontology)) +
+      geom_col(width = 0.7) +
+      scale_fill_manual(values = ontology_colours) +
+      geom_vline(xintercept = -log10(0.05), linetype = "dashed", colour = "grey40") +
+      labs(title = paste0("Top Enriched GO Terms — ", SPECIES_NAME),
+           x = expression(-log[10](p[adj])), y = NULL) +
+      theme_minimal(base_size = 13) +
+      theme(plot.title = element_text(face = "bold"), legend.position = "top")
+  }, w = 12, h = 9)
+
+  # Volcano-style
+  safe_save("enrichment_volcano.png", function() {
+    ggplot(combined_df, aes(x = log2(FoldEnrichment), y = neg_log10_padj)) +
+      geom_point(aes(size = Count, colour = Ontology), alpha = 0.7) +
+      scale_colour_manual(values = ontology_colours) +
+      scale_size_continuous(range = c(2, 9), name = "Gene Count") +
+      geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey40") +
+      labs(title = "Enrichment Volcano", x = expression(log[2](Fold~Enrichment)),
+           y = expression(-log[10](p[adj]))) +
+      theme_minimal(base_size = 12) +
+      theme(plot.title = element_text(face = "bold", size = 14))
+  }, w = 11, h = 8)
+
+  # Faceted dot matrix
+  safe_save("dot_matrix_faceted.png", function() {
+    facet_df <- combined_df %>%
+      group_by(Ontology) %>% slice_min(p.adjust, n = 15) %>% ungroup() %>%
+      mutate(Description = str_wrap(Description, 40),
+             Ontology_label = recode(Ontology,
+               "BP" = "Biological Process", "MF" = "Molecular Function",
+               "CC" = "Cellular Component"))
+    ggplot(facet_df, aes(x = GeneRatioNum,
+                         y = reorder(Description, GeneRatioNum))) +
+      geom_point(aes(size = Count, colour = neg_log10_padj)) +
+      scale_colour_gradient(low = "#FEE8C8", high = "#B30000",
+                            name = expression(-log[10](p[adj]))) +
+      scale_size_continuous(range = c(2, 8), name = "Gene Count") +
+      facet_wrap(~ Ontology_label, scales = "free_y", ncol = 3) +
+      labs(title = paste0("GO Enrichment Overview — ", SPECIES_NAME),
+           x = "Gene Ratio", y = NULL) +
+      theme_minimal(base_size = 11) +
+      theme(plot.title = element_text(face = "bold", size = 14),
+            strip.text = element_text(face = "bold", size = 12),
+            panel.border = element_rect(colour = "grey80", fill = NA))
+  }, w = 14, h = 10)
+}
+
+cat("\n--- All plots saved to:", PLOT_DIR, "---\n")
+list.files(PLOT_DIR, pattern = "\\.png$")
+```
+
+# Export Results
+
+```{r export}
+# ── Save per-ontology TSV files ──
+imap(enrich_results, function(res, ont) {
+  if (!is.null(res) && nrow(as.data.frame(res)) > 0) {
+    out_file <- file.path(OUT_DIR, paste0("GO_enrichment_", ont, ".tsv"))
+    write.table(
+      as.data.frame(res),
+      file      = out_file,
+      sep       = "\t",
+      row.names = FALSE,
+      quote     = FALSE
+    )
+    message("Saved: ", out_file)
+  }
+})
+
+# ── Save combined results ──
+if (nrow(combined_df) > 0) {
+  combined_out <- file.path(OUT_DIR, "GO_enrichment_combined.tsv")
+  write.table(combined_df, file = combined_out, sep = "\t",
+              row.names = FALSE, quote = FALSE)
+  message("Saved: ", combined_out)
+}
+```
+
+# Manual Fisher's Exact Test (for Reference)
+
+For transparency, here is the manual implementation of the same over-
+representation test that `enricher()` performs internally.  This can be useful
+for debugging or for understanding the statistics.
+
+```{r manual-fisher}
+# Pick one ontology for demonstration
+demo_t2g <- t2g_list[["BP"]]
+demo_t2n <- t2n_list[["BP"]]
+
+# IMPORTANT: restrict N and n to genes that appear in the BP TERM2GENE,
+# matching what enricher() does internally.  Using the full background
+# (all ontologies) would dilute N and n with genes that have no BP
+# annotation, making the test slightly more conservative than enricher().
+bp_universe <- intersect(bg_chars, unique(demo_t2g$gene))
+bp_de       <- intersect(de_chars, unique(demo_t2g$gene))
+N <- length(bp_universe)
+n <- length(bp_de)
+
+cat(sprintf(
+  "Manual Fisher (BP): N = %d background genes, n = %d DE genes (BP-annotated only)\n",
+  N, n
+))
+
+manual_results <- demo_t2g %>%
+  group_by(term) %>%
+  summarise(
+    K = n_distinct(gene),                                    # genes in background with this term
+    k = sum(gene %in% de_chars),                             # DE genes with this term
+    .groups = "drop"
+  ) %>%
+  filter(k >= 2, K >= MIN_GENE_SET, K <= MAX_GENE_SET) %>%  # minimum overlap & set size
+  rowwise() %>%
+  mutate(
+    pvalue = fisher.test(
+      matrix(c(k, K - k, n - k, N - K - n + k), nrow = 2),
+      alternative = "greater"
+    )$p.value,
+    fold_enrichment = (k / n) / (K / N),
+    GeneRatio = paste0(k, "/", n),
+    BgRatio   = paste0(K, "/", N)
+  ) %>%
+  ungroup() %>%
+  mutate(padj = p.adjust(pvalue, method = "BH")) %>%
+  left_join(demo_t2n, by = "term") %>%
+  arrange(padj)
+
+manual_results %>%
+  filter(padj < PVALUE_CUTOFF) %>%
+  dplyr::select(term, name, k, K, GeneRatio, BgRatio, fold_enrichment, pvalue, padj) %>%
+  mutate(across(c(pvalue, padj), ~ signif(.x, 3)),
+         fold_enrichment = round(fold_enrichment, 2)) %>%
+  datatable(
+    rownames = FALSE,
+    caption  = "Manual Fisher's exact test results (BP) — should match enricher() output",
+    options  = list(pageLength = 15, scrollX = TRUE)
+  )
+```
+
+# Tips for Your Own Analysis
+
+## Choosing the Right Background
+
+The **background (universe)** profoundly affects your results:
+  
+- **Best practice**: use all genes that were *expressed and testable* in your
+  experiment (e.g., all genes that passed DESeq2's independent filtering).
+- **Acceptable fallback**: all genes in `gene2go` for your organism (what this
+  pipeline uses by default).
+- **Avoid**: using the entire genome (inflates significance) or no universe at
+  all (enricher defaults to all genes in TERM2GENE, which is correct only if
+  every gene was testable).
+
+## Supplementing Sparse Annotations
+
+For non-model organisms, `gene2go` annotations are often limited to IEA
+(electronic inference).  To improve coverage:
+
+1. **eggNOG-mapper** (<http://eggnog-mapper.embl.de/>): upload your protein
+   FASTA; returns GO, KEGG, COG annotations via ortholog mapping.
+2. **InterProScan**: domain-based GO assignment for every protein.
+3. **Trinotate** (if using Trinity for *de novo* assembly): wraps BLAST,
+   HMMER, and GO assignment into one pipeline.
+
+After obtaining additional annotations, merge them into `TERM2GENE` before
+running `enricher()`.
+
+## GO Hierarchy (DAG Propagation) — topGO Analysis
+
+A gene annotated with GO:0006954 (inflammatory response) should also be counted
+under its ancestor GO:0006952 (defense response).  `enricher()` does **not**
+propagate annotations up the GO directed acyclic graph (DAG).
+
+`topGO` explicitly traverses the hierarchy and offers algorithms that
+decorrelate parent–child redundancy:
+
+- **classic**: standard Fisher's exact test (no hierarchy awareness — baseline).
+- **weight01** (recommended): a hybrid of the *weight* and *elim* algorithms
+  that down-weights broad parent terms when their children are already
+  significant, yielding more specific, interpretable results.
+- **elim**: removes genes from parent terms once a child term is significant.
+
+```{r topgo-setup}
+if (!requireNamespace("topGO", quietly = TRUE)) {
+  message("topGO not installed — skipping DAG-aware enrichment.\n",
+          "Install with: BiocManager::install('topGO')")
+  RUN_TOPGO <- FALSE
+} else {
+  library(topGO)
+  RUN_TOPGO <- TRUE
+}
+```
+
+### Run topGO for All Three Ontologies {.tabset}
+
+```{r topgo-run}
+if (RUN_TOPGO) {
+  # ── Build gene-to-GO mapping (named list) ──
+  gene2GO_list <- split(gene2go_sp$GO_ID, as.character(gene2go_sp$GeneID))
+
+  # ── Named factor: 1 = DE, 0 = not DE ──
+  all_genes <- factor(as.integer(bg_chars %in% de_chars))
+  names(all_genes) <- bg_chars
+
+  # ── Run for each ontology ──
+  ontologies <- c("BP", "MF", "CC")
+  topgo_results <- list()
+
+  for (ont in ontologies) {
+    message("Running topGO for ", ont, " ...")
+
+    # Build topGOdata object
+    GOdata <- tryCatch(
+      new("topGOdata",
+          ontology  = ont,
+          allGenes  = all_genes,
+          annot     = annFUN.gene2GO,
+          gene2GO   = gene2GO_list,
+          nodeSize  = MIN_GENE_SET),
+      error = function(e) {
+        message("  topGOdata failed for ", ont, ": ", e$message)
+        NULL
+      }
+    )
+    if (is.null(GOdata)) next
+
+    # Classic Fisher (baseline)
+    res_classic  <- runTest(GOdata, algorithm = "classic",
+                             statistic = "fisher")
+    # Weight01 (DAG-aware, recommended)
+    res_weight01 <- runTest(GOdata, algorithm = "weight01",
+                             statistic = "fisher")
+    # Elim (alternative DAG-aware)
+    res_elim     <- runTest(GOdata, algorithm = "elim",
+                             statistic = "fisher")
+
+    # Combine into a summary table
+    n_terms <- min(50, length(usedGO(GOdata)))
+    allRes <- GenTable(
+      GOdata,
+      classic  = res_classic,
+      weight01 = res_weight01,
+      elim     = res_elim,
+      orderBy  = "weight01",
+      ranksOf  = "classic",
+      topNodes = n_terms
+    )
+
+    # Clean up p-value columns (GenTable returns character with "< 1e-30" etc.)
+    allRes <- allRes %>%
+      mutate(
+        across(c(classic, weight01, elim), ~ {
+          x <- gsub("< ", "", .x)
+          as.numeric(x)
+        }),
+        Ontology = ont,
+        # BH correction on classic only — weight01/elim account for GO DAG
+        # structure and their p-values should be used directly without further
+        # BH adjustment (Alexa & Rahnenführer, 2009)
+        classic_padj = p.adjust(classic, method = "BH")
+      )
+
+    topgo_results[[ont]] <- allRes
+    message("  ", ont, ": ", sum(allRes$weight01 < PVALUE_CUTOFF, na.rm = TRUE),
+            " terms with weight01 p < ", PVALUE_CUTOFF)
+  }
+}
+```
+
+#### BP — topGO Results
+
+```{r topgo-bp-table}
+if (RUN_TOPGO && !is.null(topgo_results[["BP"]])) {
+  topgo_results[["BP"]] %>%
+    mutate(across(c(classic, weight01, elim, classic_padj),
+                  ~ signif(.x, 3))) %>%
+    datatable(
+      rownames = FALSE,
+      caption  = "topGO Biological Process — weight01 + classic + elim",
+      options  = list(pageLength = 20, scrollX = TRUE)
+    )
+} else {
+  cat("topGO BP results not available.\n")
+}
+```
+
+#### MF — topGO Results
+
+```{r topgo-mf-table}
+if (RUN_TOPGO && !is.null(topgo_results[["MF"]])) {
+  topgo_results[["MF"]] %>%
+    mutate(across(c(classic, weight01, elim, classic_padj),
+                  ~ signif(.x, 3))) %>%
+    datatable(
+      rownames = FALSE,
+      caption  = "topGO Molecular Function — weight01 + classic + elim",
+      options  = list(pageLength = 20, scrollX = TRUE)
+    )
+} else {
+  cat("topGO MF results not available.\n")
+}
+```
+
+#### CC — topGO Results
+
+```{r topgo-cc-table}
+if (RUN_TOPGO && !is.null(topgo_results[["CC"]])) {
+  topgo_results[["CC"]] %>%
+    mutate(across(c(classic, weight01, elim, classic_padj),
+                  ~ signif(.x, 3))) %>%
+    datatable(
+      rownames = FALSE,
+      caption  = "topGO Cellular Component — weight01 + classic + elim",
+      options  = list(pageLength = 20, scrollX = TRUE)
+    )
+} else {
+  cat("topGO CC results not available.\n")
+}
+```
+
+### {-}
+
+### topGO Visualisations {.tabset}
+
+#### Algorithm Comparison (Classic vs. Weight01)
+
+Scatter plot comparing p-values from the classic (no hierarchy) and weight01
+(DAG-aware) algorithms.  Points below the diagonal are terms that become *more*
+significant after hierarchy correction; points above become *less* significant
+(broad parent terms down-weighted).
+
+```{r topgo-scatter, fig.width=10, fig.height=8}
+if (RUN_TOPGO && length(topgo_results) > 0) {
+  topgo_combined <- bind_rows(topgo_results)
+
+  p <- ggplot(topgo_combined,
+              aes(x = -log10(classic), y = -log10(weight01))) +
+    geom_point(aes(colour = Ontology, size = Significant), alpha = 0.6) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+                colour = "grey40") +
+    scale_colour_manual(values = ontology_colours) +
+    scale_size_continuous(range = c(1.5, 7), name = "DE Genes\nin Term") +
+    ggrepel::geom_text_repel(
+      data = topgo_combined %>%
+        group_by(Ontology) %>%
+        slice_min(weight01, n = 5) %>%
+        ungroup(),
+      aes(label = str_trunc(Term, 35)),
+      size = 3, max.overlaps = 15, box.padding = 0.5,
+      show.legend = FALSE
+    ) +
+    labs(
+      title = "topGO: Classic vs. Weight01 Algorithm",
+      subtitle = "Points below diagonal = more significant after DAG correction",
+      x = expression(-log[10](p[classic])),
+      y = expression(-log[10](p[weight01]))
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold", size = 14))
+  print(p)
+}
+```
+
+#### topGO Bar Plot (Weight01)
+
+Top enriched terms from topGO's weight01 algorithm across all ontologies.
+
+```{r topgo-barplot, fig.width=12, fig.height=9}
+if (RUN_TOPGO && length(topgo_results) > 0) {
+  topgo_bar <- topgo_combined %>%
+    filter(weight01 < PVALUE_CUTOFF) %>%
+    group_by(Ontology) %>%
+    slice_min(weight01, n = 10) %>%
+    ungroup() %>%
+    mutate(
+      Term = str_wrap(Term, width = 45),
+      Term = fct_reorder(Term, -log10(weight01))
+    )
+
+  if (nrow(topgo_bar) > 0) {
+    p <- ggplot(topgo_bar, aes(x = -log10(weight01), y = Term,
+                                fill = Ontology)) +
+      geom_col(width = 0.7) +
+      scale_fill_manual(values = ontology_colours) +
+      geom_vline(xintercept = -log10(0.05), linetype = "dashed",
+                 colour = "grey40") +
+      labs(
+        title = "topGO Weight01 — Top Enriched GO Terms",
+        x     = expression(-log[10](p[weight01])),
+        y     = NULL
+      ) +
+      theme_minimal(base_size = 12) +
+      theme(plot.title = element_text(face = "bold", size = 14),
+            legend.position = "top")
+    print(p)
+  } else {
+    cat("No terms with weight01 p <", PVALUE_CUTOFF, "\n")
+  }
+}
+```
+
+#### {-}
+
+### enricher() vs. topGO Comparison {.tabset}
+
+Which terms appear in both methods vs. only one?  Terms found by both are high
+confidence; terms unique to topGO are typically more specific (hierarchy-aware),
+while terms unique to enricher may be broad parent terms inflated by
+unadjusted annotation propagation.
+
+> **Note on thresholds:** enricher results are filtered by BH-adjusted p-value
+> (`p.adjust < 0.05`), while topGO weight01 results use the raw algorithm
+> p-value (`weight01 < 0.05`).  This follows the recommended practice for each
+> method — weight01 p-values already account for DAG structure and should not
+> be BH-corrected further (Alexa & Rahnenführer, 2009).  Consequently, the
+> comparison is not strictly apples-to-apples: a term appearing as "topGO only"
+> may partly reflect the less stringent threshold rather than a biological
+> difference.
+
+```{r comparison-table}
+if (RUN_TOPGO && length(topgo_results) > 0 && nrow(combined_df) > 0) {
+  comparison_list <- list()
+
+  for (ont in names(enrich_results)) {
+    # enricher significant terms
+    enricher_sig <- combined_df %>%
+      filter(Ontology == ont, p.adjust < PVALUE_CUTOFF) %>%
+      dplyr::select(GO_ID = ID, Description,
+                    enricher_padj = p.adjust, enricher_count = Count)
+
+    # topGO significant terms (weight01)
+    if (!is.null(topgo_results[[ont]])) {
+      topgo_sig <- topgo_results[[ont]] %>%
+        filter(weight01 < PVALUE_CUTOFF) %>%
+        dplyr::select(GO_ID = GO.ID, Term,
+                      topGO_weight01 = weight01, topGO_annotated = Annotated,
+                      topGO_significant = Significant)
+
+      comp <- full_join(enricher_sig, topgo_sig, by = "GO_ID") %>%
+        mutate(
+          Found_in = case_when(
+            !is.na(enricher_padj) & !is.na(topGO_weight01) ~ "Both",
+            !is.na(enricher_padj)                           ~ "enricher only",
+            TRUE                                             ~ "topGO only"
+          ),
+          Name = coalesce(Description, Term),
+          Ontology = ont
+        ) %>%
+        dplyr::select(Ontology, GO_ID, Name, Found_in,
+                      enricher_padj, topGO_weight01)
+
+      comparison_list[[ont]] <- comp
+    }
+  }
+
+  comparison_df <- bind_rows(comparison_list)
+}
+```
+
+#### Comparison Table
+
+```{r comparison-dt}
+if (exists("comparison_df") && nrow(comparison_df) > 0) {
+  comparison_df %>%
+    mutate(across(c(enricher_padj, topGO_weight01), ~ signif(.x, 3))) %>%
+    arrange(Found_in, Ontology) %>%
+    datatable(
+      rownames = FALSE,
+      caption  = "enricher() vs. topGO weight01 — term overlap",
+      filter   = "top",
+      options  = list(pageLength = 25, scrollX = TRUE)
+    )
+} else {
+  cat("Comparison not available.\n")
+}
+```
+
+#### Overlap Summary
+
+```{r comparison-summary, fig.width=10, fig.height=6}
+if (exists("comparison_df") && nrow(comparison_df) > 0) {
+  overlap_counts <- comparison_df %>%
+    count(Ontology, Found_in, name = "n_terms")
+
+  p <- ggplot(overlap_counts,
+              aes(x = Ontology, y = n_terms, fill = Found_in)) +
+    geom_col(position = "dodge", width = 0.7) +
+    geom_text(aes(label = n_terms),
+              position = position_dodge(width = 0.7), vjust = -0.3,
+              size = 4, fontface = "bold") +
+    scale_fill_manual(
+      values = c("Both"          = "#2C7BB6",
+                 "enricher only" = "#D7191C",
+                 "topGO only"    = "#1A9641"),
+      name = "Found in"
+    ) +
+    labs(
+      title = "enricher() vs. topGO — Term Overlap by Ontology",
+      subtitle = "'Both' = high-confidence terms; 'topGO only' = hierarchy-refined specifics",
+      x = NULL,
+      y = "Number of significant terms"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(plot.title = element_text(face = "bold", size = 14),
+          legend.position = "top")
+  print(p)
+}
+```
+
+#### Significance Concordance
+
+For terms found by both methods, how well do the p-values agree?
+
+```{r concordance-scatter, fig.width=10, fig.height=8}
+if (exists("comparison_df") && nrow(comparison_df) > 0) {
+  both_df <- comparison_df %>%
+    filter(Found_in == "Both") %>%
+    filter(!is.na(enricher_padj), !is.na(topGO_weight01))
+
+  if (nrow(both_df) >= 3) {
+    p <- ggplot(both_df,
+                aes(x = -log10(enricher_padj),
+                    y = -log10(topGO_weight01))) +
+      geom_point(aes(colour = Ontology), size = 3, alpha = 0.7) +
+      geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+                  colour = "grey40") +
+      scale_colour_manual(values = ontology_colours) +
+      ggrepel::geom_text_repel(
+        data = both_df %>% slice_min(enricher_padj, n = 8),
+        aes(label = str_trunc(Name, 35)),
+        size = 3, max.overlaps = 12, show.legend = FALSE
+      ) +
+      labs(
+        title = "Significance Concordance — enricher() vs. topGO",
+        subtitle = "Diagonal shown for reference (axes use different correction methods)",
+        x = expression(-log[10](enricher~p[adj]~(BH))),
+        y = expression(-log[10](topGO~weight01~p~(raw)))
+      ) +
+      theme_minimal(base_size = 12) +
+      theme(plot.title = element_text(face = "bold", size = 14))
+    print(p)
+  } else {
+    cat("Fewer than 3 terms found by both methods — skipping concordance plot.\n")
+  }
+}
+```
+
+#### {-}
+
+### Export topGO Results
+
+```{r topgo-export}
+if (RUN_TOPGO && length(topgo_results) > 0) {
+  # Per-ontology topGO results
+  for (ont in names(topgo_results)) {
+    out_file <- file.path(OUT_DIR, paste0("topGO_", ont, ".tsv"))
+    write.table(topgo_results[[ont]], file = out_file, sep = "\t",
+                row.names = FALSE, quote = FALSE)
+    message("Saved: ", out_file)
+  }
+
+  # Comparison table
+  if (exists("comparison_df") && nrow(comparison_df) > 0) {
+    comp_file <- file.path(OUT_DIR, "enricher_vs_topGO_comparison.tsv")
+    write.table(comparison_df, file = comp_file, sep = "\t",
+                row.names = FALSE, quote = FALSE)
+    message("Saved: ", comp_file)
+  }
+}
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
