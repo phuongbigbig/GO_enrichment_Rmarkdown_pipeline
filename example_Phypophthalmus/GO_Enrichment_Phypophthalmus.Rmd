@@ -80,8 +80,9 @@ library(ggrepel)
 # ggwordcloud loaded conditionally in the word cloud chunk
 
 # ── Resolve namespace conflicts ──
-# AnnotationDbi::select() masks dplyr::select(); restore dplyr as default
+# AnnotationDbi::select() and IRanges::slice() mask dplyr equivalents
 select <- dplyr::select
+slice  <- dplyr::slice
 ```
 
 ## Define Parameters
@@ -343,7 +344,7 @@ convert_symbols_to_ids <- function(symbols, gene_info) {
   if (nrow(dupes) > 0) {
     cat(sprintf("  %d symbols mapped to multiple IDs (first match kept):\n",
                 n_distinct(dupes$input)))
-    matched <- matched %>% group_by(input) %>% slice(1) %>% ungroup()
+    matched <- matched %>% group_by(input) %>% dplyr::slice(1) %>% ungroup()
   }
 
   list(
