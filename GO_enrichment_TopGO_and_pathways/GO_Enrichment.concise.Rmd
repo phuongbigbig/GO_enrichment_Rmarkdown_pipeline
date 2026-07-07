@@ -755,6 +755,24 @@ if (nrow(combined_df) > 0) {
 walks the GO hierarchy and down-weights broad parent terms whose children are
 already significant, giving more specific, less redundant results.
 
+Three raw p-value columns are reported per term: **`classic`** (a plain Fisher
+test on DAG-propagated counts, no hierarchy weighting), **`weight01`** and
+**`elim`** (both DAG-aware). Only `classic` is FDR-adjusted, and it is shown
+**two ways, side by side**, because the choice of BH denominator changes the
+result substantially:
+
+- **`classic_padj_ora`** — BH over *testable* terms only (≥ 1 DE gene and
+  background size ≤ `MAX_GENE_SET`). This matches the `enricher()`/ORA convention
+  used elsewhere in this pipeline and is the value to compare against `enricher`.
+- **`classic_padj_allGO`** — BH over *every* scored node in the ontology (the
+  strict "whole-ontology scan" FDR). Thousands of terms have no DE genes and
+  p ≈ 1, so they inflate the denominator; this column is markedly more
+  conservative and is provided for reference / stricter reporting.
+
+`weight01` and `elim` are intentionally left as raw p-values: their algorithms
+already account for the GO DAG structure and should not be BH-corrected again
+(Alexa & Rahnenführer, 2009).
+
 ```{r topgo-run}
 topgo_results <- list()
 if (RUN_TOPGO && !requireNamespace("topGO", quietly = TRUE)) {
@@ -779,10 +797,26 @@ if (RUN_TOPGO) {
     res_weight01 <- runTest(GOdata, algorithm = "weight01", statistic = "fisher")
     res_elim     <- runTest(GOdata, algorithm = "elim",     statistic = "fisher")
 
-    # BH correction for the classic algorithm must use ALL tested terms, not just
-    # the rows GenTable prints — so adjust the full score() vector and join back.
-    padj_df <- tibble(GO.ID = names(score(res_classic)),
-                      classic_padj = p.adjust(score(res_classic), method = PADJ_METHOD))
+    # ── FDR for the classic algorithm — reported TWO ways, side by side ─────
+    # "classic" scores EVERY ontology node that survived nodeSize pruning,
+    # including thousands with zero DE genes (Fisher p ≈ 1). The denominator of
+    # the BH correction changes the result substantially, so both conventions
+    # are reported:
+    #   • classic_padj_ora   : BH over "testable" terms only (≥ 1 DE gene AND
+    #                          background ≤ MAX_GENE_SET) — matches enricher()/ORA.
+    #   • classic_padj_allGO : BH over EVERY scored ontology node — the strict
+    #                          "whole-ontology scan" FDR (much more conservative).
+    # Both use the FULL term set (not just the top rows GenTable prints).
+    # weight01/elim stay as raw p-values: their algorithms already account for
+    # the GO DAG and should not be BH-corrected again (Alexa & Rahnenführer 2009).
+    ts        <- termStat(GOdata)          # Annotated / Significant / Expected per GO.ID
+    classic_p <- score(res_classic)        # raw Fisher p-value per GO.ID
+    testable  <- rownames(ts)[ts$Significant >= 1 & ts$Annotated <= MAX_GENE_SET]
+    padj_ora  <- setNames(rep(NA_real_, length(classic_p)), names(classic_p))
+    padj_ora[testable] <- p.adjust(classic_p[testable], method = PADJ_METHOD)
+    padj_df   <- tibble(GO.ID              = names(classic_p),
+                        classic_padj_ora   = padj_ora,
+                        classic_padj_allGO = p.adjust(classic_p, method = PADJ_METHOD))
 
     allRes <- GenTable(GOdata, classic = res_classic, weight01 = res_weight01,
                        elim = res_elim, orderBy = "weight01", ranksOf = "classic",
@@ -807,9 +841,11 @@ topgo_table <- function(ont) {
     cat("topGO results not available for", ont, "\n"); return(invisible())
   }
   res %>%
-    mutate(across(c(classic, weight01, elim, classic_padj), ~ signif(.x, 3))) %>%
+    mutate(across(c(classic, weight01, elim, classic_padj_ora, classic_padj_allGO),
+                  ~ signif(.x, 3))) %>%
     datatable(rownames = FALSE,
-              caption = paste0("topGO ", ont, " — weight01 (DAG-aware) + classic + elim"),
+              caption = paste0("topGO ", ont, " — raw p (classic/weight01/elim) plus ",
+                               "classic FDR two ways: _ora (testable terms) vs _allGO (whole ontology)"),
               options = list(pageLength = 15, scrollX = TRUE))
 }
 ```
