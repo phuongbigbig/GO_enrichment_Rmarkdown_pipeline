@@ -1,0 +1,40 @@
+# Sample DE gene list — GENE SYMBOLS format
+# Organism: Pangasianodon hypophthalmus (striped catfish)
+# Same genes as de_gene_list.txt but using symbols instead of numeric IDs
+# Requires Phypophthalmus_gene_info.tsv for conversion
+#
+# ── Immune / inflammatory signalling ──
+tlr3
+irf9
+irf4a
+irf10
+irf4b
+nfkb1
+rela
+il15
+cxcl12b
+xcr1b.2
+ccr12a
+xcr1b.1
+blk
+samhd1a
+LOC113534100
+trim13
+zbtb1
+#
+# ── Apoptosis / cell death ──
+fas
+faslg
+tnfrsf21
+#
+# ── Other / signalling ──
+lplb
+aplnr2
+aplnra
+agtr1b
+gpr25
+enpp2l
+enpp2
+ggt1a
+tfap2c
+lrrc71
