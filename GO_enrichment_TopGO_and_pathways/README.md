@@ -28,7 +28,8 @@ Pipeline file: **`GO_Enrichment.concise.Rmd`**
 13. [Pathway enrichment & ortholog mapping](#pathway-enrichment--ortholog-mapping)
 14. [Adapting to Another Species](#adapting-to-another-species)
 15. [Troubleshooting](#troubleshooting)
-16. [Citation](#citation)
+16. [Changelog — robustness and edge-case fixes](#changelog--robustness-and-edge-case-fixes)
+17. [Citation](#citation)
 
 ---
 
@@ -119,10 +120,14 @@ project/
 
 - CRAN: `tidyverse`, `DT`, `scales`, `ggrepel`, `rbioapi`
 - Bioconductor (GO): `clusterProfiler`, `enrichplot`, `GO.db`, `AnnotationDbi`, `topGO`
-- Bioconductor (pathways): `ReactomePA`, `DOSE`, `biomaRt`, `KEGGREST`, and a
+- Bioconductor (pathways): `ReactomePA`, `DOSE`, `biomaRt`, and a
   **reference-organism** OrgDb such as `org.Dr.eg.db` (zebrafish),
   `org.Gg.eg.db` (chicken) or `org.Hs.eg.db` (human) — match this to your
-  `ORTHO_ORGDB` parameter.
+  `ORTHO_ORGDB` parameter. `KEGGREST` is optional: `enrichKEGG()` downloads
+  KEGG data itself.
+- `biomaRt` and the OrgDb are only needed to **build** the ortholog map. If you
+  already have `ORTHO_FILE` (e.g. built offline from NCBI `gene_orthologs`),
+  the ortholog-based databases run without them.
 
 > The GO half runs with only the "GO" packages. The pathway half is optional and
 > can be turned off with `RUN_PATHWAY_ENRICHMENT <- FALSE`.
@@ -191,6 +196,12 @@ gunzip gene_orthologs.gz
 } | sort -u > Phypophthalmus_to_drerio_orthologs.tsv
 ```
 
+A map built by the pipeline also gets a `ref_orgdb` column (e.g.
+`org.Dr.eg.db`) that records which reference it was built for. If you later
+change `ORTHO_ORGDB`, the pipeline stops with a clear message instead of reusing
+the wrong map. Hand-built files without this column are accepted as they are,
+so make sure they match `ORTHO_ORGDB` yourself.
+
 > After building the small filtered files, you can delete the large genome-wide
 > downloads — only the per-organism TSVs are used.
 
@@ -216,7 +227,15 @@ nfkb1
 ```
 
 **Rules:** one gene per line; `#` starts a comment; inline comments after a `#`
-are stripped; blank lines ignored; do not mix IDs and symbols.
+are stripped; blank lines ignored; duplicate lines are removed. A list that
+mixes numeric IDs and symbols is accepted: numeric IDs are kept as they are and
+symbols are converted (this needs the gene_info file). The report prints how
+many of each were found.
+
+DE genes that are not in the background are dropped (the report prints how
+many). The knit stops with a clear message if **no** DE gene is left, or if
+**every** background gene is a DE gene, because over-representation cannot be
+tested in either case.
 
 **From DESeq2:**
 
@@ -227,7 +246,10 @@ writeLines(sig_genes, "de_gene_list.txt")
 ```
 
 **Optional custom background** — the set of genes actually expressed/testable in
-your experiment (recommended over the default of all annotated genes):
+your experiment (recommended over the default of all annotated genes). If
+`BACKGROUND_FILE` is set but the file does not exist (e.g. a typo), the pipeline
+prints a warning, falls back to all annotated genes, and the Summary shows the
+background that was **actually** used:
 
 ```r
 all_tested <- rownames(res)[!is.na(res$padj)]
@@ -367,6 +389,27 @@ Ordering note: ortholog mapping runs **before** KEGG, so KEGG can also be run on
 orthologs (`KEGG_VIA_ORTHOLOGS = TRUE`, with `KEGG_ORG` set to the reference
 code, e.g. `gga`) when your species is absent from KEGG.
 
+**One reference per run.** The pipeline builds a single ortholog map, to
+`ORTHO_ORGDB`. Every ortholog-based database therefore receives that organism's
+Entrez IDs, so `REACTOME_ORG`, `WP_ORGANISM`, `PANTHER_TAXID` (and `KEGG_ORG`
+when `KEGG_VIA_ORTHOLOGS = TRUE`) must name the **same** organism. For the
+known reference packages (`org.Dr.eg.db`, `org.Gg.eg.db`, `org.Hs.eg.db`,
+`org.Mm.eg.db`, `org.Rn.eg.db`) the parameters chunk checks this. A database
+that points at a different organism is **skipped** with a printed warning,
+instead of silently returning nothing or nonsense. For other OrgDb packages
+no check is made.
+
+**PANTHER is over-representation only.** PANTHER's Fisher test reports both
+over- and under-represented pathways. The pipeline keeps only over-represented
+ones (`plus_minus == "+"`, or `fold_enrichment > 1` if that column is
+missing), so the results match the other ORA databases. Only PANTHER pathways
+with FDR < `PVALUE_CUTOFF` enter the combined pathway plots and table.
+
+**Paralogs.** One-to-many orthologs are kept, so a catfish gene that maps to
+both zebrafish paralogs (e.g. *gene_a* and *gene_b*) can count twice in a
+pathway. This is the usual practice, but check pathway hits that depend on
+paralog pairs.
+
 > **Different references, different backgrounds.** Each database's p-values are
 > relative to its own universe. PANTHER in particular uses its own whole-genome
 > reference, so cross-database comparisons in the Summary are qualitative, not
@@ -394,9 +437,14 @@ TaxID as in [Step 2](#step-2--build-the-annotation-files).
 | WikiPathways | `clusterProfiler::get_wp_organisms()` | ✅ `Gallus gallus` |
 | PANTHER | `rbioapi::rba_panther_info()` | ✅ TaxID `9031` |
 
-Because chicken is **not** in `ReactomePA`, map Reactome to **human** (build a
-second ortholog file, or set `REACTOME_ORG` and skip if unavailable), while
-KEGG / WikiPathways / PANTHER use chicken.
+Because chicken is **not** in `ReactomePA`, a chicken run cannot include
+Reactome. With a chicken ortholog map, `REACTOME_ORG <- "human"` would receive
+chicken IDs, so the pipeline detects the mismatch and **skips Reactome** with a
+warning. To get Reactome for a bird, knit the document a second time with
+`ORTHO_ORGDB <- "org.Hs.eg.db"`, `REACTOME_ORG <- "human"`,
+`ORTHO_BIOMART_PREFIX <- "hsapiens"`, `ORTHO_ENSEMBL_DATASET <-
+"hsapiens_gene_ensembl"` and a **separate** `ORTHO_FILE` (e.g.
+`<yourbird>_to_hsapiens_orthologs.tsv`).
 
 **Step 3.** Set the parameters:
 
@@ -409,7 +457,7 @@ ORTHO_FILE            <- "<yourbird>_to_ggallus_orthologs.tsv"
 
 KEGG_ORG              <- "gga"        # chicken KEGG code
 KEGG_VIA_ORTHOLOGS    <- TRUE         # if your bird is not in KEGG
-REACTOME_ORG          <- "human"      # chicken unsupported by ReactomePA
+REACTOME_ORG          <- "human"      # chicken unsupported by ReactomePA → auto-skipped in this run
 WP_ORGANISM           <- "Gallus gallus"
 PANTHER_TAXID         <- 9031
 
@@ -457,9 +505,33 @@ The pipeline uses a custom `enrich_barplot()`; no action needed.
 
 ### KEGG / Reactome / PANTHER return nothing or error
 These call remote APIs — transient failures are caught and the section is
-skipped rather than halting the knit. For Reactome, confirm your `REACTOME_ORG`
-is in the supported set. If your species has few orthologs, the
-`ENOUGH_ORTHOLOGS` guard skips the ortholog-based databases.
+skipped rather than halting the knit. **The reason is printed in the report**
+as a line starting with `Note:` (or `WARNING:` in the parameters chunk) —
+look there first. Common reasons:
+
+- the database's organism does not match `ORTHO_ORGDB` (see
+  [One reference per run](#pathway-enrichment--ortholog-mapping));
+- fewer than `MIN_GENE_SET` DE genes mapped to orthologs (the
+  `ortholog-mapping` chunk prints the counts);
+- `rbioapi` / `ReactomePA` not installed;
+- the API was down or changed its output format (re-run later).
+
+### `object 'fdr' not found` in the `panther-plot` chunk
+Fixed in the current version. It happened when PANTHER was skipped or returned
+nothing: the empty placeholder table had no columns, and the plot chunk
+filtered on `fdr` before checking whether the table had rows.
+
+### `Ortholog file ... was built for org.X but ORTHO_ORGDB is org.Y`
+You changed the reference organism but kept the old cached ortholog map.
+Delete `ORTHO_FILE` (it will be rebuilt) or point `ORTHO_FILE` at a new name.
+
+### `Every background gene is a DE gene`
+Your DE list and background are the same set, so there is nothing to test.
+Check that `DE_GENE_FILE` and `BACKGROUND_FILE` point at the right files.
+
+### Pandoc warning `Deprecated: --mathjax`
+Harmless and now silenced: the YAML header sets `mathjax: null` because the
+report has no LaTeX math in the text (plot axis labels are drawn by R).
 
 ### topGO / no significant terms
 Small or sparsely annotated gene lists may yield nothing, especially under the
@@ -470,6 +542,76 @@ using the default all-annotated background if your custom one is very small.
 ### Caching
 Caching is **off** (`cache = FALSE`) so results never go stale between runs. A
 full run may take a few minutes; the API-backed pathway steps dominate the time.
+
+---
+
+## Changelog — robustness and edge-case fixes
+
+The pipeline ran correctly on the striped catfish data set before this review.
+The fixes below cover cases where it could **stop the knit**, **skip an
+analysis without saying why**, or — most importantly — **give a wrong result
+without any error**. Every change is marked with a `[FIX]` comment in
+`GO_Enrichment.concise.Rmd`; search for `[FIX]` to find them. All R chunks
+were checked to parse; the full document should be re-knitted on real data
+to confirm.
+
+### A. Fixes that change results (wrong output without any error)
+
+| # | Chunk | Problem | When it happened | Fix |
+|---|---|---|---|---|
+| A1 | `load-gene2go` | NCBI `gene2go` rows with a **NOT** qualifier (e.g. `NOT enables`, `NOT involved_in`) were counted as positive annotations. These mean the gene is explicitly **not** linked to the term. | Any species whose `gene2go` contains NOT rows. | Rows whose `Qualifier` starts with `NOT` are removed before analysis; the number removed is printed. Rows with missing `GeneID` / `GO_ID` are also dropped. |
+| A2 | `panther-run` | PANTHER's Fisher test returns both **over-** and **under-represented** pathways. Strongly *depleted* pathways were reported as significant hits. | Any run where PANTHER found a depleted pathway. | Keep only `plus_minus == "+"` (or `fold_enrichment > 1` if that column is absent). |
+| A3 | `topgo-run` | `GenTable(topNodes = min(50, ...))` kept only the **top 50** terms per ontology. topGO counts were capped at 50, and the enricher-vs-topGO overlap was biased toward "enricher only". | Any ontology with > 50 scored terms. | `topNodes` = all scored nodes. |
+| A4 | `topgo-run` | `GenTable` cuts term names to **40 characters** by default, so long names were truncated in tables and plots. | Any GO term name > 40 characters. | `numChar = 1000`. |
+| A5 | `topgo-run` | topGO results had no upper size limit, unlike `enricher()` (`maxGSSize`), so the two methods tested different sets of terms. | Terms with > `MAX_GENE_SET` annotated genes. | Filter `Annotated <= MAX_GENE_SET`. P-values reported as `"< 1e-30"` are now parsed robustly (`as.character()` before removing `<`). |
+| A6 | `topgo-plots` | The weight01-vs-classic scatter said "below diagonal = **more** significant after DAG correction". With weight01 on the y-axis, points below the diagonal are **less** significant (redundant parent terms are down-weighted). | Always (interpretation only). | Comment and subtitle corrected. |
+| A7 | `go-combined`, `integrated-summary` | When the **same term name** appeared in two sources (e.g. "Ribosome" in GO-CC and KEGG, or a name shared by two ontologies), `geom_col()` **stacked** them into one bar whose length was the **sum** of both −log10 values. | Any duplicated description among the plotted terms. | Duplicated names get a suffix, e.g. `Ribosome [KEGG]`, `... [BP]`. The dot plot / bar plot helpers and the PANTHER plot also use `make.unique()` so factor levels are never duplicated. |
+| A8 | `helpers` and all plots | A p-value that underflows to **0** gives `-log10(0) = Inf`; ggplot silently **drops** non-finite values, so the *strongest* term disappeared from the plot. A log10 colour scale also fails on 0. | Very strong enrichments (p < ~1e-308) or APIs that return 0. | New helper `nlog10()` floors p at `.Machine$double.xmin` before taking −log10; used in every −log10 calculation. `enrich_barplot()` floors `p.adjust` the same way. |
+| A9 | `pathway-combined-build` | `panther_clean` holds **every** tested PANTHER pathway (`cutoff = 1`), while KEGG / Reactome / WikiPathways contribute only significant terms. PANTHER flooded the combined dot plot, volcano and integrated overview with non-significant pathways. | Any run with PANTHER results. | Only PANTHER rows with `fdr < PVALUE_CUTOFF` enter `all_pathway_df`. `ID` is coerced to character so `bind_rows()` never fails on type differences. |
+| A10 | all top-N selections | `slice_min(..., n = k)` keeps **ties**, so "top 10" could return many more rows when several terms share a p-value, distorting plot sizes. | Tied p-values (common with small gene counts). | `with_ties = FALSE` everywhere. |
+| A11 | `input-gene-list` | In a list that **mixed** numeric IDs and symbols, the numeric IDs were sent through symbol matching, never matched, and were **silently lost**. Duplicate lines also inflated the reported counts. | Mixed or duplicated input lists. | Input is de-duplicated; numeric IDs are kept as they are and only the symbols are converted; the split is printed. Background is also de-duplicated. |
+| A12 | `params` | If an ortholog-based database pointed at a **different organism** than `ORTHO_ORGDB` (e.g. chicken map but `REACTOME_ORG = "human"`), it received the wrong organism's IDs and returned nothing or nonsense. | Mixed reference set-ups, as the old README suggested for birds. | New reference-consistency check (`REF_LOOKUP` table) for zebrafish, chicken, human, mouse and rat OrgDbs. Mismatched databases are **skipped** with a printed `WARNING:`. Unknown OrgDbs are not checked. |
+
+### B. Fixes that stop the knit from failing or skipping work
+
+| # | Chunk | Problem | When it happened | Fix |
+|---|---|---|---|---|
+| B1 | `panther-run`, `panther-plot` | `panther_clean <- tibble()` had **no columns**. `panther-plot` ran `filter(fdr < PVALUE_CUTOFF)` before its `nrow() > 0` guard → `object 'fdr' not found`. | PANTHER skipped, failed, or returned nothing. | Typed empty placeholder `panther_empty` (all expected columns) and the guard now runs **before** filtering. |
+| B2 | `panther-run` | Cleaning of the PANTHER response was outside `tryCatch`; a renamed column in the API output stopped the whole knit. | PANTHER API format change. | Cleaning is wrapped in `tryCatch`; on failure a note is printed and the empty table is used. |
+| B3 | `manual-bp/mf/cc` | `manual_results[["CC"]] %>% filter(...)` stopped the knit when an ontology had **no annotations** for the species (`NULL`). | Sparse annotations (e.g. no CC terms). | New NULL-safe `manual_table(ont)` helper used by all three chunks. |
+| B4 | `pathway-packages` | `RUN_ORTHO_PATHWAYS` required **both** `biomaRt` and the OrgDb, even when a ready `ORTHO_FILE` existed. All ortholog-based databases were skipped for no reason. | Offline-built ortholog file without biomaRt installed. | Runs if `ORTHO_FILE` exists, **or** biomaRt is available, **or** OrgDb + gene_info allow symbol matching. The BioMart step checks for `biomaRt` itself. |
+| B5 | `pathway-packages`, `kegg-run` | KEGG was gated on `KEGGREST` being installed, although `enrichKEGG()` does not need it. | KEGGREST not installed. | KEGG no longer depends on KEGGREST. |
+| B6 | `ortholog-mapping` | A `NULL` ortholog map (all strategies failed) crashed the following `filter()`. Hand-built files with blank / non-numeric IDs gave type mismatches. | No map could be built, or a hand-made TSV. | `NULL` → typed empty table; `sp_geneid` / `ref_entrez` coerced to integer and NA rows dropped. |
+| B7 | `topgo-run` | The gene factor was built without fixed levels; topGO needs a 2-level factor. An ontology with **no GO nodes** after pruning caused `GenTable` errors. | Edge cases with tiny gene sets. | `factor(..., levels = c(0, 1))`; ontologies with 0 nodes are skipped with a note. |
+| B8 | `load-gene2go`, `load-gene-info`, `ortholog-mapping` | `read.delim()` treats `"` as a quote character. A stray quote in a GO term name or gene description **merged lines silently**. | Any text field containing `"` or `'`. | `quote = ""` (and `comment.char = ""`) for gene2go, gene_info and the ortholog file. |
+| B9 | `load-gene2go`, `load-gene-info` | Missing columns in the gene_info file only failed much later with an unclear error; an empty gene2go after filtering was not caught. | Wrong or truncated input files. | Early, explicit `stop()` messages naming the missing columns / empty file. |
+| B10 | `input-gene-list` | No check for a degenerate test where every background gene is DE. | DE file = background file by mistake. | Clear `stop()` (checked after the "no DE genes left" check). |
+| B11 | `params` | Logical switches were not validated. | Typo such as `RUN_TOPGO <- "yes"`. | `stopifnot(is.logical(...))` for `KEGG_VIA_ORTHOLOGS`, `RUN_TOPGO`, `RUN_PATHWAY_ENRICHMENT`. |
+
+### C. Fixes to reporting (the report now says what really happened)
+
+| # | Chunk | Problem | Fix |
+|---|---|---|---|
+| C1 | `helpers` (used everywhere) | The setup chunk sets `message = FALSE`, so **every** `message("... skipped / failed ...")` was invisible in the HTML. It was impossible to see *why* PANTHER or Reactome was empty. | New helper `say()` prints `Note: ...` into the chunk output; all status/failure messages use it (only "Saved: file" messages stay hidden). |
+| C2 | `input-gene-list`, `summary-params` | A misspelled `BACKGROUND_FILE` fell back silently to all annotated genes, while the Summary still showed the file name as the background used. | Prints a `WARNING:`; new `BACKGROUND_USED` variable is what the Summary reports. |
+| C3 | `ortholog-mapping` | Changing `ORTHO_ORGDB` silently reused the old cached map (e.g. zebrafish IDs sent to chicken databases). | Newly built maps get a `ref_orgdb` column; a mismatch stops with a clear message. Maps built before this change have no tag and cannot be checked. |
+| C4 | `reactome-run`, `wp-run`, `panther-run`, `pathway-summary-table`, `pathway-combined-plots` | Captions, subtitles and the Strategy column were hard-coded as "zebrafish orthologs" / "Direct (phyp)". | All derived from the parameters (`REF_LABEL`, `KEGG_ORG`, `KEGG_VIA_ORTHOLOGS`). |
+| C5 | `go-export` | `imap()` returned a list of `NULL`s that was auto-printed into the report as `$BP NULL $CC NULL ...`. | `iwalk()`. |
+| C6 | YAML header | Pandoc 3 printed `[WARNING] Deprecated: --mathjax`. | `mathjax: null` (the report has no LaTeX math in the text). |
+| C7 | Rmd text, "Adapting to another species" | The text suggested mixing a chicken map with human Reactome in one run, which A12 now (correctly) skips. | Rewritten: one reference per run; run the document again for human Reactome. |
+
+### Known limitations (not changed)
+
+- **Paralogs:** one-to-many orthologs are kept, so a gene can count twice in a
+  pathway through paralog pairs (see
+  [Pathway enrichment & ortholog mapping](#pathway-enrichment--ortholog-mapping)).
+- **Reference check coverage:** only the five OrgDb packages listed in A12 are
+  checked; other references are trusted as configured.
+- **Untagged ortholog caches:** files built before this version (or by hand)
+  have no `ref_orgdb` column, so C3 cannot detect a mismatch for them.
+- **PANTHER background:** PANTHER still uses its own whole-genome reference
+  rather than your custom background, so its p-values are not directly
+  comparable with the other databases.
 
 ---
 
@@ -487,4 +629,3 @@ If you use this pipeline, please cite the underlying tools:
   interface to biologic web services' API. *Bioinformatics*, 38(10), 2952–2953.
 - **Gene Ontology:** Gene Ontology Consortium (2023). The Gene Ontology
   knowledgebase in 2023. *Genetics*, 224(1), iyad031.
-```
